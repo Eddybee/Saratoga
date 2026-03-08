@@ -1,0 +1,30 @@
+.DS_Store
+.vscode/
+
+# Python
+.venv/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local backend config and runtime artifacts
+app/backend/.env
+app/backend/uploads/
+app/backend/renders/
+app/backend/exports/
+
+# Frontend dependencies and build output
+app/frontend/node_modules/
+app/frontend/dist/
+app/frontend/dist-ssr/
+app/frontend/.vite/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Generated workbook output
+plan_extractions.xlsx
