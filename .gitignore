@@ -28,6 +28,8 @@ pnpm-debug.log*
 
 # Generated workbook output
 plan_extractions.xlsx
+*.xlsx
+*.csv
 
 # Source PDFs kept locally, not in git
 *.pdf
