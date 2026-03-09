@@ -40,6 +40,8 @@ _LLM_MODEL = "gpt-5-mini"
 _LLM_PRICING_PER_MILLION = {
     "gpt-5-mini": {"input": 0.25, "output": 2.00},
 }
+LLM_SEND_MAX_SIDE_PX = 3200
+LLM_RETRY_SEND_MAX_SIDE_PX = 2400
 EXTRACTION_HEADERS = ["Item", "Dimensions", "Notes"]
 _LLM_RESPONSE_FORMAT = {
     "type": "json_schema",
@@ -74,9 +76,9 @@ _LLM_RESPONSE_FORMAT = {
     },
 }
 PAGE_RENDER_DPI = 144
-MAX_TILE_SIDE_PX = 2800
-MAX_TILE_AREA_PX = 8_000_000
-MAX_TILE_COUNT = 9
+MAX_TILE_SIDE_PX = 1800
+MAX_TILE_AREA_PX = 3_000_000
+MAX_TILE_COUNT = 6
 TILE_OVERLAP_RATIO = 0.08
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -421,7 +423,7 @@ def _pil_to_base64(img: Image.Image, fmt: str = "PNG") -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def optimize_llm_image(pil_img: Image.Image) -> Image.Image:
+def optimize_llm_image(pil_img: Image.Image, max_send_side: int = LLM_SEND_MAX_SIDE_PX) -> Image.Image:
     img = pil_img.convert("RGB")
     img = ImageOps.expand(img, border=16, fill="white")
 
@@ -434,6 +436,15 @@ def optimize_llm_image(pil_img: Image.Image) -> Image.Image:
         scale = target_min_side / min_side
         if max_side * scale > target_max_side:
             scale = target_max_side / max_side
+        new_size = (
+            max(1, int(round(img.width * scale))),
+            max(1, int(round(img.height * scale))),
+        )
+        img = img.resize(new_size, Image.Resampling.LANCZOS)
+
+    max_side = max(img.size)
+    if max_side > max_send_side:
+        scale = max_send_side / max_side
         new_size = (
             max(1, int(round(img.width * scale))),
             max(1, int(round(img.height * scale))),
@@ -517,7 +528,7 @@ def normalize_llm_rows(rows: Any) -> list[list[str]]:
 
 
 def combine_llm_results(results: list[dict]) -> dict:
-    headers = ["Item", "Dimensions", "Notes"]
+    headers = EXTRACTION_HEADERS
     combined_rows: list[list[str]] = []
     combined_lines: list[str] = []
     fallback_lines: list[str] = []
@@ -573,6 +584,20 @@ def combine_llm_results(results: list[dict]) -> dict:
     }
 
 
+def has_meaningful_llm_content(result: dict) -> bool:
+    structured_lines = result.get("structured_lines") or []
+    if any(str(line).strip() for line in structured_lines):
+        return True
+
+    table_data = result.get("table_data") or []
+    if table_data and isinstance(table_data[0], list) and len(table_data[0]) > 1:
+        for row in table_data[0][1:]:
+            if any(str(cell).strip() for cell in row):
+                return True
+
+    return bool(_clean_text(result.get("text", "")))
+
+
 def get_usage_value(usage: Any, *names: str) -> int:
     for name in names:
         value = getattr(usage, name, None)
@@ -596,86 +621,127 @@ def run_llm_extraction(pil_img: Image.Image, label: str = "") -> dict:
     if not _openai_available or not _openai_client:
         raise RuntimeError("OpenAI API is not configured")
 
-    prepared_img = optimize_llm_image(pil_img)
-    b64 = _pil_to_base64(prepared_img, "PNG")
     raw_text = ""
+    total_input_tokens = 0
+    total_output_tokens = 0
+    attempt_plans = [
+        {
+            "max_send_side": LLM_SEND_MAX_SIDE_PX,
+            "retry_note": "",
+        },
+        {
+            "max_send_side": LLM_RETRY_SEND_MAX_SIDE_PX,
+            "retry_note": (
+                " The previous attempt returned no usable content. Return ONLY valid JSON matching "
+                "the required schema. If any text is visible, provide a best-effort extraction "
+                "instead of an empty response."
+            ),
+        },
+    ]
 
-    user_msg = "Extract all data from this construction plan image."
-    if label:
-        user_msg += f' The user labelled this region: "{label}".'
+    for attempt_index, attempt in enumerate(attempt_plans, start=1):
+        prepared_img = optimize_llm_image(pil_img, max_send_side=attempt["max_send_side"])
+        b64 = _pil_to_base64(prepared_img, "PNG")
 
-    try:
-        response = _openai_client.chat.completions.create(
-            model=_LLM_MODEL,
-            messages=[
-                {"role": "system", "content": _LLM_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_msg},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/png;base64,{b64}",
-                                "detail": "high",
+        user_msg = "Extract all data from this construction plan image."
+        if label:
+            user_msg += f' The user labelled this region: "{label}".'
+        user_msg += attempt["retry_note"]
+
+        try:
+            response = _openai_client.chat.completions.create(
+                model=_LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": _LLM_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": user_msg},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{b64}",
+                                    "detail": "high",
+                                },
                             },
-                        },
-                    ],
+                        ],
+                    },
+                ],
+                max_completion_tokens=4096,
+                response_format=_LLM_RESPONSE_FORMAT,
+                temperature=1,
+            )
+
+            usage = getattr(response, "usage", None)
+            total_input_tokens += get_usage_value(usage, "prompt_tokens", "input_tokens")
+            total_output_tokens += get_usage_value(usage, "completion_tokens", "output_tokens")
+
+            raw_text = (response.choices[0].message.content or "").strip()
+            logger.info("LLM attempt %s raw response length: %s chars", attempt_index, len(raw_text))
+
+            parsed = extract_json_object(raw_text)
+            headers = EXTRACTION_HEADERS
+            rows = normalize_llm_rows(parsed.get("rows", []))
+            avg_confidence = score_llm_result(headers, rows)
+            estimated_cost = estimate_llm_cost(_LLM_MODEL, total_input_tokens, total_output_tokens)
+
+            table_data = [[headers] + rows]
+            text_lines = []
+            for row in rows:
+                parts = [str(cell) for cell in row if str(cell).strip()]
+                text_lines.append(" | ".join(parts))
+
+            full_text = "\n".join(text_lines)
+
+            return {
+                "text": full_text,
+                "table_data": table_data,
+                "structured_lines": text_lines,
+                "method": "llm_gpt5_mini",
+                "avg_confidence": avg_confidence,
+                "raw_response": raw_text,
+                "usage": {
+                    "input_tokens": total_input_tokens,
+                    "output_tokens": total_output_tokens,
+                    "estimated_cost_usd": estimated_cost,
                 },
-            ],
-            max_completion_tokens=4096,
-            response_format=_LLM_RESPONSE_FORMAT,
-            temperature=1,
-        )
+            }
+        except json.JSONDecodeError as exc:
+            logger.warning("LLM JSON parse failed on attempt %s: %s", attempt_index, exc)
+            if raw_text or attempt_index == len(attempt_plans):
+                estimated_cost = estimate_llm_cost(_LLM_MODEL, total_input_tokens, total_output_tokens)
+                return {
+                    "text": raw_text,
+                    "table_data": [[EXTRACTION_HEADERS, ["", "", raw_text]]],
+                    "structured_lines": [raw_text] if raw_text else [],
+                    "method": "llm_gpt5_mini_raw",
+                    "avg_confidence": 60,
+                    "raw_response": raw_text,
+                    "usage": {
+                        "input_tokens": total_input_tokens,
+                        "output_tokens": total_output_tokens,
+                        "estimated_cost_usd": estimated_cost,
+                    },
+                }
+            logger.info("Retrying extraction after empty LLM response")
+        except Exception as exc:
+            logger.error("LLM extraction failed on attempt %s: %s", attempt_index, exc)
+            raise RuntimeError(f"LLM extraction failed: {str(exc)}")
 
-        raw_text = response.choices[0].message.content.strip()
-        logger.info("LLM raw response length: %s chars", len(raw_text))
-
-        parsed = extract_json_object(raw_text)
-        headers = EXTRACTION_HEADERS
-        rows = normalize_llm_rows(parsed.get("rows", []))
-        avg_confidence = score_llm_result(headers, rows)
-
-        usage = getattr(response, "usage", None)
-        input_tokens = get_usage_value(usage, "prompt_tokens", "input_tokens")
-        output_tokens = get_usage_value(usage, "completion_tokens", "output_tokens")
-        estimated_cost = estimate_llm_cost(_LLM_MODEL, input_tokens, output_tokens)
-
-        table_data = [[headers] + rows]
-        text_lines = []
-        for row in rows:
-            parts = [str(cell) for cell in row if str(cell).strip()]
-            text_lines.append(" | ".join(parts))
-
-        full_text = "\n".join(text_lines)
-
-        return {
-            "text": full_text,
-            "table_data": table_data,
-            "structured_lines": text_lines,
-            "method": "llm_gpt5_mini",
-            "avg_confidence": avg_confidence,
-            "raw_response": raw_text,
-            "usage": {
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "estimated_cost_usd": estimated_cost,
-            },
-        }
-    except json.JSONDecodeError as exc:
-        logger.warning("LLM JSON parse failed: %s", exc)
-        return {
-            "text": raw_text,
-            "table_data": [[EXTRACTION_HEADERS, ["", "", raw_text]]],
-            "structured_lines": [raw_text] if raw_text else [],
-            "method": "llm_gpt5_mini_raw",
-            "avg_confidence": 60,
-            "raw_response": raw_text,
-            "usage": {},
-        }
-    except Exception as exc:
-        logger.error("LLM extraction failed: %s", exc)
-        raise RuntimeError(f"LLM extraction failed: {str(exc)}")
+    estimated_cost = estimate_llm_cost(_LLM_MODEL, total_input_tokens, total_output_tokens)
+    return {
+        "text": raw_text,
+        "table_data": [[EXTRACTION_HEADERS, ["", "", raw_text]]],
+        "structured_lines": [raw_text] if raw_text else [],
+        "method": "llm_gpt5_mini_raw",
+        "avg_confidence": 60,
+        "raw_response": raw_text,
+        "usage": {
+            "input_tokens": total_input_tokens,
+            "output_tokens": total_output_tokens,
+            "estimated_cost_usd": estimated_cost,
+        },
+    }
 
 
 def _clean_text(raw: str) -> str:
