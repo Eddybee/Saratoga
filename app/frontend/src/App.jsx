@@ -29,6 +29,7 @@ function formatTokens(value) {
 function formatExtractionRoute(method) {
   if (!method) return "Unknown";
   if (method === "llm_gpt5_mini") return "GPT-5 Mini Vision";
+  if (method === "llm_gpt5_mini_tiled") return "GPT-5 Mini Vision (tiled)";
   if (method === "llm_gpt5_mini_raw") return "GPT-5 Mini Vision (raw)";
   return method.replace(/_/g, " ");
 }
