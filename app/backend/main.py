@@ -22,6 +22,26 @@ from openpyxl.utils import get_column_letter
 from PIL import Image, ImageEnhance, ImageOps
 from pydantic import BaseModel
 
+try:
+    import cv2
+    import numpy as np
+    _opencv_available = True
+except Exception:
+    _opencv_available = False
+
+try:
+    import pytesseract
+    _pytesseract_available = True
+except Exception:
+    _pytesseract_available = False
+
+try:
+    import jsonschema
+    from jsonschema import ValidationError
+    _jsonschema_available = True
+except Exception:
+    _jsonschema_available = False
+
 load_dotenv()
 
 _openai_available = False
@@ -456,6 +476,133 @@ def optimize_llm_image(pil_img: Image.Image, max_send_side: int = LLM_SEND_MAX_S
     return img
 
 
+def preprocess_for_ocr(pil_img: Image.Image) -> Image.Image:
+    """Apply OpenCV preprocessing: grayscale, denoise, adaptive thresholding, deskew, morphology."""
+    if not _opencv_available:
+        return pil_img
+
+    try:
+        arr = np.array(pil_img.convert("RGB"))
+        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        gray = cv2.medianBlur(gray, 3)
+
+        th = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 10
+        )
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        morphed = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel)
+
+        coords = np.column_stack(np.where(morphed < 255))
+        if coords.shape[0] > 0:
+            angle = cv2.minAreaRect(coords)[-1]
+            if angle < -45:
+                angle = -(90 + angle)
+            else:
+                angle = -angle
+            if abs(angle) > 0.1:
+                (h, w) = morphed.shape[:2]
+                center = (w // 2, h // 2)
+                M = cv2.getRotationMatrix2D(center, angle, 1.0)
+                rotated = cv2.warpAffine(
+                    morphed, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE
+                )
+                morphed = rotated
+
+        return Image.fromarray(morphed)
+    except Exception:
+        return pil_img
+
+
+def ocr_text_from_pdf_clip(pdf_path: str, page_num: int, clip: fitz.Rect) -> str:
+    """Attempt text extraction using PyMuPDF first, then fall back to Tesseract (if available)."""
+    text = ""
+    try:
+        doc = fitz.open(pdf_path)
+        try:
+            page = doc[page_num]
+            try:
+                text = page.get_text("text", clip=clip)
+                if text and len(text.strip()) >= 20:
+                    logger.info("PyMuPDF OCR found %s chars", len(text.strip()))
+                    return text
+            except Exception:
+                text = ""
+        finally:
+            doc.close()
+    except Exception:
+        text = ""
+
+    if not _pytesseract_available:
+        return text or ""
+
+    try:
+        pil_img = render_clip_from_pdf(pdf_path, page_num, clip, dpi=recommended_render_dpi(clip))
+        pil_img = preprocess_for_ocr(pil_img)
+        ocr_result = pytesseract.image_to_string(pil_img, config="--psm 6")
+        logger.info("Tesseract OCR found %s chars", len(ocr_result.strip()))
+        return ocr_result or text or ""
+    except Exception as exc:
+        logger.warning("Tesseract OCR failed: %s", exc)
+        return text or ""
+
+
+def parse_table_text_to_rows(text: str) -> list[list[str]]:
+    """Simple heuristic parser to convert OCR text into rows of 3 columns (Item, Dimensions, Notes)."""
+    rows: list[list[str]] = []
+    if not text:
+        return rows
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for line in lines:
+        parts = []
+        if "\t" in line:
+            parts = [p.strip() for p in line.split("\t") if p.strip()]
+        elif "|" in line:
+            parts = [p.strip() for p in line.split("|") if p.strip()]
+        else:
+            parts = [p.strip() for p in re.split(r"\s{2,}", line) if p.strip()]
+
+        if not parts:
+            continue
+
+        if len(parts) >= 3:
+            rows.append([parts[0], parts[1], " | ".join(parts[2:])])
+        elif len(parts) == 2:
+            rows.append([parts[0], parts[1], ""])
+        else:
+            single = parts[0]
+            m = re.search(r"(\d+[^\s,]*)", single)
+            if m:
+                item = single[: m.start()].strip() or single
+                dims = m.group(1).strip()
+                notes = single[m.end() :].strip()
+                rows.append([item, dims, notes])
+            else:
+                rows.append([single, "", ""])
+
+    return rows
+
+
+def validate_llm_schema(parsed: dict) -> bool:
+    """Validate parsed LLM output against the expected JSON schema."""
+    schema = _LLM_RESPONSE_FORMAT.get("json_schema", {}).get("schema") if isinstance(_LLM_RESPONSE_FORMAT, dict) else None
+    if not schema:
+        return False
+    try:
+        if _jsonschema_available:
+            jsonschema.validate(instance=parsed, schema=schema)
+            return True
+        if not isinstance(parsed, dict):
+            return False
+        if "headers" not in parsed or "rows" not in parsed:
+            return False
+        if not isinstance(parsed["headers"], list) or not isinstance(parsed["rows"], list):
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def extract_json_object(text: str) -> dict:
     cleaned = text.strip()
     if cleaned.startswith("```"):
@@ -667,9 +814,9 @@ def run_llm_extraction(pil_img: Image.Image, label: str = "") -> dict:
                         ],
                     },
                 ],
-                max_completion_tokens=4096,
+                max_completion_tokens=1024,
                 response_format=_LLM_RESPONSE_FORMAT,
-                temperature=1,
+                temperature=0,
             )
 
             usage = getattr(response, "usage", None)
@@ -680,6 +827,10 @@ def run_llm_extraction(pil_img: Image.Image, label: str = "") -> dict:
             logger.info("LLM attempt %s raw response length: %s chars", attempt_index, len(raw_text))
 
             parsed = extract_json_object(raw_text)
+            # Validate against schema if possible
+            if not validate_llm_schema(parsed):
+                logger.warning("LLM response failed JSON schema validation")
+                raise json.JSONDecodeError("Schema validation failed", raw_text, 0)
             headers = EXTRACTION_HEADERS
             rows = normalize_llm_rows(parsed.get("rows", []))
             avg_confidence = score_llm_result(headers, rows)
@@ -786,6 +937,45 @@ async def extract_aoi(req: AOIRequest, request: Request):
     preview_img.thumbnail((600, 400))
     cropped_preview = _pil_to_base64(preview_img)
 
+    # Try OCR-first (PyMuPDF native text extraction, then Tesseract if available)
+    try:
+        await ensure_request_connected(request)
+        ocr_text = ocr_text_from_pdf_clip(info["path"], req.page, clip)
+        ocr_rows = parse_table_text_to_rows(ocr_text)
+        has_meaningful = any(any(cell.strip() for cell in row) for row in ocr_rows) if ocr_rows else False
+        if has_meaningful:
+            ext_id = str(uuid.uuid4())[:8]
+            structured_lines = [" | ".join(cell for cell in row if cell.strip()) for row in ocr_rows]
+            table_data = [[EXTRACTION_HEADERS] + ocr_rows]
+            extraction = {
+                "id": ext_id,
+                "pdf_id": req.pdf_id,
+                "page": req.page,
+                "label": req.label or "",
+                "raw_text": ocr_text,
+                "cleaned_text": _clean_text(ocr_text),
+                "table_data": table_data,
+                "structured_lines": structured_lines,
+                "avg_confidence": 85.0,
+                "extraction_method": "ocr_tesseract" if _pytesseract_available else "ocr_pymupdf",
+                "cropped_preview": cropped_preview,
+                "llm_usage": {"input_tokens": 0, "output_tokens": 0, "estimated_cost_usd": 0.0},
+                "region": {
+                    "pct_x": req.pct_x,
+                    "pct_y": req.pct_y,
+                    "pct_w": req.pct_w,
+                    "pct_h": req.pct_h,
+                },
+            }
+            extraction_store.append(extraction)
+            logger.info("OCR extraction %s: %s chars, method=%s", ext_id, len(ocr_text), extraction["extraction_method"])
+            return extraction
+    except ClientDisconnectedError as exc:
+        raise HTTPException(status_code=499, detail="Extraction cancelled") from exc
+    except Exception as exc:
+        logger.warning("OCR extraction failed: %s", exc)
+
+    # OCR didn't yield a usable result; fall back to LLM extraction if configured
     if not _openai_available:
         raise HTTPException(status_code=503, detail="OpenAI Vision is not configured")
 
